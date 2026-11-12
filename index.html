@@ -439,7 +439,11 @@ svg text { font-family: var(--font); }
   var CONFIG = {
     brand: 'SAVI VISION',
     subtitle: 'COMMAND CENTRE',
-    location: { name: 'New Delhi', lat: 28.6139, lon: 77.2090 },
+    location: { name: 'New Delhi', lat: 28.6139, lon: 77.2090, state: 'Delhi' },
+    // Official CPCB station AQI via data.gov.in (free key). Leave '' to use satellite-model AQI only.
+    cpcbApiKey: '579b464db66ec23bdd0000017e01e6129881439159d480e5da08d6db',
+    cpcbStations: 3,      // average of the nearest N stations…
+    cpcbRadiusKm: 6,      // …within this distance of the location
     newsFeed: 'https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en',
     cameras: [
       { name: 'HIGHWAY NORTH', scene: 'highway', src: '' },
@@ -494,12 +498,13 @@ svg text { font-family: var(--font); }
   /* ---------------- URL parameters ---------------- */
   var P = {
     city: param('city'), lat: param('lat'), lon: param('lon'), name: param('name'),
-    brand: param('brand'), sub: param('sub'), news: param('news'), tags: param('tags'),
+    brand: param('brand'), sub: param('sub'), news: param('news'), tags: param('tags'), state: param('state'), cpcbkey: param('cpcbkey'),
     cams: [param('cam1'), param('cam2'), param('cam3')]
   };
   if (P.brand) CONFIG.brand = P.brand.slice(0, 22);
   if (P.sub) CONFIG.subtitle = P.sub.slice(0, 26);
   if (P.tags === 'off') CONFIG.showDemoTags = false;
+  if (P.cpcbkey && /^[A-Za-z0-9]{20,80}$/.test(P.cpcbkey)) CONFIG.cpcbApiKey = P.cpcbkey;
   if (P.news && /^https?:\/\//i.test(P.news)) CONFIG.newsFeed = P.news;
   P.cams.forEach(function (u, i) { if (u && /^https?:\/\/|^[\w\-.\/]+\.(mp4|webm|ogg|jpe?g|png|webp|gif)$/i.test(u)) CONFIG.cameras[i].src = u; });
 
@@ -558,11 +563,11 @@ svg text { font-family: var(--font); }
   /* =====================================================================
      LOCATION
      ===================================================================== */
-  var LOC = { name: CONFIG.location.name, lat: CONFIG.location.lat, lon: CONFIG.location.lon };
+  var LOC = { name: CONFIG.location.name, lat: CONFIG.location.lat, lon: CONFIG.location.lon, state: CONFIG.location.state };
   function resolveLocation() {
     var la = parseFloat(P.lat), lo = parseFloat(P.lon);
     if (num(la) && num(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
-      LOC = { name: P.name || P.city || 'Site', lat: la, lon: lo };
+      LOC = { name: P.name || P.city || 'Site', lat: la, lon: lo, state: P.state || '' };
       return Promise.resolve();
     }
     if (!P.city) return Promise.resolve();
@@ -572,7 +577,11 @@ svg text { font-family: var(--font); }
     return fetchWith('https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=' + encodeURIComponent(P.city), 'json')
       .then(function (j) {
         var r = j && j.results && j.results[0];
-        if (r) { LOC = { name: P.name || r.name, lat: r.latitude, lon: r.longitude }; store(key, LOC); }
+        if (r) {
+          var st = r.country_code === 'IN' ? (r.admin1 === 'National Capital Territory of Delhi' ? 'Delhi' : (r.admin1 || '')) : '';
+          LOC = { name: P.name || r.name, lat: r.latitude, lon: r.longitude, state: P.state || st };
+          store(key, LOC);
+        }
       })
       .catch(function () { /* keep default */ });
   }
@@ -848,15 +857,8 @@ svg text { font-family: var(--font); }
       var a = subIndex(c.pm2_5, BP.pm2_5), b = subIndex(c.pm10, BP.pm10);
       if (a !== null || b !== null) now = (b === null || (a !== null && a >= b)) ? { v: Math.round(a), dom: 'PM2.5' } : { v: Math.round(b), dom: 'PM10' };
     }
-    if (now) {
-      var ct = cat(now.v);
-      $('aqNum').textContent = now.v;
-      $('aqNum').style.color = ct[2];
-      $('aqCat').textContent = ct[1].toUpperCase();
-      $('aqCat').style.color = ct[2];
-      $('aqSub').textContent = 'India AQI (CPCB) · ' + now.dom + ' dominant';
-      $('aqMark').style.left = clamp(now.v / 5, 0, 100) + '%';
-    }
+    modelAqi = now;
+    if (now && !cpcbFresh()) showAqi(now.v, now.dom, 'India AQI · satellite model · ' + now.dom);
     GAUGES.forEach(function (g) {
       var v = c[g.k];
       if (!num(v)) return;
@@ -881,14 +883,96 @@ svg text { font-family: var(--font); }
       labels.push(i >= 0 ? h.time[i].slice(11, 16) : '');
     }
     drawTrend(vals, labels);
-    if (now) $('aqTrendInfo').textContent = 'Now ' + now.v + ' · ' + cat(now.v)[1];
+    if (now) $('aqTrendInfo').textContent = 'Satellite model · now ' + now.v;
+  }
 
+  var modelAqi = null, cpcbAt = 0;
+  function cpcbFresh() { return cpcbAt && Date.now() - cpcbAt < 3 * 3600000; }
+  function showAqi(v, dom, sub) {
+    var ct = cat(v);
+    $('aqNum').textContent = v;
+    $('aqNum').style.color = ct[2];
+    $('aqCat').textContent = ct[1].toUpperCase();
+    $('aqCat').style.color = ct[2];
+    $('aqSub').textContent = sub;
+    $('aqMark').style.left = clamp(v / 5, 0, 100) + '%';
     var list = [];
-    if (now && now.v > 400) list.push({ key: 'aqi', sev: 'CRITICAL', msg: 'Severe air quality · AQI ' + now.v });
-    else if (now && now.v > 300) list.push({ key: 'aqi', sev: 'CRITICAL', msg: 'Very poor air quality · AQI ' + now.v });
-    else if (now && now.v > 200) list.push({ key: 'aqi', sev: 'WARNING', msg: 'Poor air quality · AQI ' + now.v });
-    else if (now && now.v > 100) list.push({ key: 'aqi', sev: 'NOTICE', msg: 'Moderate air quality · AQI ' + now.v });
+    if (v > 400) list.push({ key: 'aqi', sev: 'CRITICAL', msg: 'Severe air quality · AQI ' + v });
+    else if (v > 300) list.push({ key: 'aqi', sev: 'CRITICAL', msg: 'Very poor air quality · AQI ' + v });
+    else if (v > 200) list.push({ key: 'aqi', sev: 'WARNING', msg: 'Poor air quality · AQI ' + v });
+    else if (v > 100) list.push({ key: 'aqi', sev: 'NOTICE', msg: 'Moderate air quality · AQI ' + v });
     setLiveAlerts('a', 'AIR QUALITY', list);
+  }
+
+  /* =====================================================================
+     OFFICIAL CPCB STATION AQI (data.gov.in "Real time Air Quality Index")
+     Values are CPCB sub-indices per pollutant; station AQI = highest sub-index.
+     ===================================================================== */
+  var PNAME = { 'PM2.5': 'PM2.5', 'PM10': 'PM10', 'NO2': 'NO₂', 'SO2': 'SO₂', 'CO': 'CO', 'OZONE': 'O₃', 'NH3': 'NH₃' };
+  function km(a1, o1, a2, o2) {
+    var r = Math.PI / 180, dA = (a2 - a1) * r, dO = (o2 - o1) * r;
+    var x = Math.sin(dA / 2) * Math.sin(dA / 2) + Math.cos(a1 * r) * Math.cos(a2 * r) * Math.sin(dO / 2) * Math.sin(dO / 2);
+    return 12742 * Math.asin(Math.sqrt(x));
+  }
+  function cpcbStationsFrom(records) {
+    var by = {};
+    records.forEach(function (r) {
+      var name = r.station; if (!name) return;
+      var v = parseFloat(r.avg_value !== undefined ? r.avg_value : r.pollutant_avg);
+      var la = parseFloat(r.latitude), lo = parseFloat(r.longitude);
+      if (!by[name]) by[name] = { name: name, lat: la, lon: lo, upd: r.last_update || '', subs: {} };
+      if (num(v) && v >= 0) by[name].subs[String(r.pollutant_id || '').toUpperCase()] = v;
+    });
+    var out = [];
+    Object.keys(by).forEach(function (k) {
+      var s = by[k], ids = Object.keys(s.subs);
+      if (!num(s.lat) || !num(s.lon)) return;
+      if (ids.length < 3 || (s.subs['PM2.5'] === undefined && s.subs['PM10'] === undefined)) return;   // CPCB minimum-data rule
+      var best = null;
+      ids.forEach(function (id) { if (!best || s.subs[id] > s.subs[best]) best = id; });
+      s.aqi = Math.round(s.subs[best]); s.dom = best;
+      s.dist = km(LOC.lat, LOC.lon, s.lat, s.lon);
+      out.push(s);
+    });
+    return out.sort(function (a, b) { return a.dist - b.dist; });
+  }
+  function shortName(n) { return String(n).split(',')[0].replace(/\s+-\s+.*$/, '').trim(); }
+  function renderCpcb(records) {
+    var st = cpcbStationsFrom(records);
+    if (!st.length || st[0].dist > 30) return false;
+    var pick = st.filter(function (s) { return s.dist <= CONFIG.cpcbRadiusKm; }).slice(0, CONFIG.cpcbStations);
+    if (!pick.length) pick = [st[0]];
+    var sum = 0, doms = {};
+    pick.forEach(function (s) { sum += s.aqi; doms[s.dom] = (doms[s.dom] || 0) + 1; });
+    var v = Math.round(sum / pick.length);
+    var dom = Object.keys(doms).sort(function (a, b) { return doms[b] - doms[a]; })[0];
+    var upd = (pick[0].upd.match(/(\d{1,2}):(\d{2})/) || [])[0] || '';
+    showAqi(v, dom, 'CPCB · ' + shortName(pick[0].name) + (pick.length > 1 ? ' +' + (pick.length - 1) : '') + (upd ? ' · ' + upd : ''));
+    return true;
+  }
+  function updateCpcb() {
+    if (!CONFIG.cpcbApiKey || !LOC.state) return;
+    var url = 'https://api.data.gov.in/resource/3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69?api-key=' + encodeURIComponent(CONFIG.cpcbApiKey) +
+      '&format=json&limit=1000&filters%5Bstate%5D=' + encodeURIComponent(LOC.state.replace(/ /g, '_'));
+    function parse(j) {
+      if (typeof j === 'string') j = JSON.parse(j);
+      if (!j || !j.records || !j.records.length) throw new Error('empty');
+      return j.records;
+    }
+    fetchWith(url, 'json').then(parse)
+      .catch(function () { return fetchWith('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 'text').then(parse); })
+      .then(function (records) {
+        if (renderCpcb(records)) {
+          cpcbAt = Date.now();
+          store('cr.cpcb.' + LOC.state, { t: cpcbAt, r: records });
+          okAt.air = Math.max(okAt.air, cpcbAt);
+        }
+        setTimeout(updateCpcb, 15 * 60000);
+      }, function () {
+        if (!cpcbFresh() && modelAqi) showAqi(modelAqi.v, modelAqi.dom, 'India AQI · satellite model · ' + modelAqi.dom);
+        setTimeout(updateCpcb, 5 * 60000);
+      })
+      .then(updateStatus);
   }
 
   function drawTrend(vals, labels) {
@@ -1600,8 +1684,11 @@ svg text { font-family: var(--font); }
     try { if (cw && cw.d) { okAt.weather = cw.t || 0; renderWeather(cw.d); } } catch (e) { /* ignore bad cache */ }
     try { if (ca && ca.d) { okAt.air = ca.t || 0; renderAir(ca.d); } } catch (e) { /* ignore bad cache */ }
     updateStatus();
+    var cc = load('cr.cpcb.' + LOC.state);
+    try { if (cc && cc.r && Date.now() - cc.t < 3 * 3600000 && renderCpcb(cc.r)) cpcbAt = cc.t; } catch (e) { /* ignore bad cache */ }
     updateWeather();
     updateAir();
+    updateCpcb();
   });
 })();
 </script>
